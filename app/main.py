@@ -3,15 +3,27 @@
 把多份（至多 6 份）乱序的 git bundle 导入本地裸仓库：
 
 * 按各包声明的前置提交（prerequisite）自动排出可用的验包顺序；
-* 缺包时指出缺失的提交；
+* 缺包时指出缺失的提交（完整 SHA）；
 * 只更新分支（refs/heads/*），标签等其它引用一律忽略；
 * 仓库与各包中的同名分支必须能排成同一条快进链，生效后指向链尾；
 * 验包在带 alternates 的隔离仓库里进行：照常读取现行分支，不复制已有对象库；
 * 全部包通过校验后才一起更新涉及的分支；验包期间分支已变或任一包校验失败，
   整批退回，仓库里已生效的分支保持原状。
+
+崩溃安全（对象迁入后、分支发布前被强停的场景）：
+
+* 前置提交必须能从正式库的“非临时引用”或本批已验包取入的分支到达；
+  仅存在于对象库、或只能从遗留的 refs/import/* 临时引用到达的提交一律视为缺失，
+  整批退回并列出完整 SHA（git bundle verify 只查对象存在、不查引用可达，
+  因此验包前有一道显式可达性门禁，不能只看 verify 的返回码）；
+* 进程启动（首次访问惰性触发）时逐个清理遗留的 refs/import/*，只删该引用空间，
+  不碰其他引用、不扫描也不复制对象库；删除失败仅记日志、不阻断服务，
+  残留引用也永远不会成为验包依据；
+* 停机前已发布的 refs/heads/* 不受影响，后续包可正常依赖它们。
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -40,6 +52,19 @@ app = FastAPI(title="Git bundle 批量导入")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 templates.env.filters["short"] = lambda s: (s or "")[:12]
 import_lock = threading.Lock()
+logger = logging.getLogger("bundle-import")
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+# 自带 handler，不再向 root 传播，避免与 uvicorn 的日志配置重复打印
+logger.propagate = False
+
+# 启动清理只做一次：清理上次导入在对象迁入后、分支发布前被强停而遗留的临时引用。
+_startup_cleanup_done = threading.Event()
+_startup_cleanup_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -70,9 +95,15 @@ def git(repo, *args, input_text=None, check=True):
 
 
 def list_refs(repo, prefix=""):
-    """返回 {完整引用名: sha}。prefix 如 'refs/heads/'。"""
-    out = git(repo, "for-each-ref", "--format=%(refname)%00%(objectname)",
-              prefix, check=False).stdout
+    """返回 {完整引用名: sha}。prefix 如 'refs/heads/'；空前缀列出全部引用。
+
+    注意不能把空字符串作为参数传给 git：for-each-ref 会把它当成匹配空的
+    引用模式，rc=0 但无任何输出。
+    """
+    args = ["for-each-ref", "--format=%(refname)%00%(objectname)"]
+    if prefix:
+        args.append(prefix)
+    out = git(repo, *args, check=False).stdout
     refs = {}
     for line in out.splitlines():
         if "\x00" in line:
@@ -83,6 +114,74 @@ def list_refs(repo, prefix=""):
 
 def list_branches(repo):
     return list_refs(repo, HEADS_PREFIX)
+
+
+def list_persistent_refs(repo):
+    """正式库的非临时引用。
+
+    前置提交只允许从这些引用、或本批已验包取入的分支到达；
+    refs/import/* 是导入中途（对象已迁入、分支未发布）使用的临时空间，
+    进程被强停后可能残留，绝不能充当验包依据。
+    """
+    return {ref: sha for ref, sha in list_refs(repo).items()
+            if not ref.startswith(TMP_REFS_PREFIX)}
+
+
+def delete_refs_individually(repo, refs):
+    """逐个删除引用并返回失败列表 [(ref, stderr)]。
+
+    不用 update-ref --stdin：它把整批命令放进同一事务，任何一个删除失败
+    （如目录只读）会导致整笔中止、其余引用也删不掉。逐个删除可隔离失败。
+    """
+    failed = []
+    for ref in refs:
+        proc = git(repo, "update-ref", "-d", ref, check=False)
+        if proc.returncode != 0:
+            failed.append((ref, proc.stderr.strip()))
+    return failed
+
+
+def cleanup_stale_tmp_refs(repo):
+    """删除遗留的 refs/import/* 临时引用（启动时调用一次）。
+
+    只动 refs/import/ 这一个引用空间，不碰其他引用，不扫描、不复制、
+    不删除任何对象。临时引用一时删不掉（权限/IO 问题等）也不抛出：
+    验包逻辑本身已排除该空间，残留引用不会被当作前置可达依据。
+    """
+    try:
+        stale = sorted(list_refs(repo, TMP_REFS_PREFIX))
+    except Exception as exc:  # 仓库尚未初始化等：无事可清
+        logger.warning("启动清理：无法读取仓库 %s：%s", repo, exc)
+        return
+    if not stale:
+        return
+    try:
+        failed = delete_refs_individually(repo, stale)
+    except Exception as exc:
+        # 权限/IO 等任何意外都不阻断启动；验包逻辑本身已排除该引用空间。
+        logger.error("启动清理：删除遗留临时引用时出错（共 %d 项），"
+                     "已忽略且这些引用不会被当作验包依据：%r",
+                     len(stale), exc)
+        return
+    if failed:
+        # 不阻断服务：隔离验包只镜像非临时引用，残留项不参与验包。
+        logger.error("启动清理：%d 个遗留临时引用删除失败（共 %d 项），"
+                     "它们不会被当作验包依据。首条错误：%s",
+                     len(failed), len(stale), failed[0][1])
+    else:
+        logger.info("启动清理：已删除 %d 个遗留临时引用（refs/import/*）",
+                    len(stale))
+
+
+def ensure_startup_cleanup(repo):
+    """进程内仅执行一次的启动清理（首次访问时惰性触发，避免 import 副作用）。"""
+    if _startup_cleanup_done.is_set():
+        return
+    with _startup_cleanup_lock:
+        if _startup_cleanup_done.is_set():
+            return
+        cleanup_stale_tmp_refs(repo)
+        _startup_cleanup_done.set()
 
 
 def is_ancestor(repo, old, new):
@@ -173,8 +272,11 @@ def import_bundles(repo, files):
         return result
 
     with import_lock:
+        # 进程首次导入前清理上次强停遗留的临时引用（删不掉也不影响验包正确性）
+        ensure_startup_cleanup(repo)
         work = tempfile.mkdtemp(prefix="bundle-import-")
         tmp_refs_created = False
+        batch = None
         try:
             # 1) 落盘并解析包头
             bundles = []
@@ -198,7 +300,9 @@ def import_bundles(repo, files):
                     return result
 
             # 2) 记录现行分支，并搭建隔离仓库：
-            #    alternates 指向现行对象库（照常读取、无需复制），镜像现行引用。
+            #    alternates 指向现行对象库（照常读取、无需复制），
+            #    只镜像正式库的非临时引用——refs/import/* 残留项不得作为
+            #    前置提交的可达依据（对象在盘上但无持久引用背书也算缺失）。
             snapshot0 = list_branches(repo)
             q = os.path.join(work, "q.git")
             git(None, "init", "-q", "--bare", q)
@@ -206,10 +310,14 @@ def import_bundles(repo, files):
             os.makedirs(info_dir, exist_ok=True)
             with open(os.path.join(info_dir, "alternates"), "w") as fh:
                 fh.write(os.path.join(os.path.abspath(repo), "objects") + "\n")
-            for ref, sha in list_refs(repo).items():
+            for ref, sha in list_persistent_refs(repo).items():
                 git(q, "update-ref", ref, sha, check=False)
 
-            # 3) 依前置提交确定验包顺序：能验则验，验过即取入隔离库，循环推进
+            # 3) 依前置提交确定验包顺序：前置可达才验，验过即取入隔离库，循环推进。
+            #    可达依据 = 正式库非临时引用（已镜像进 q）+ 本批已验包取入的
+            #    refs/q/*。注意 git bundle verify 只检查前置对象是否存在于对象库，
+            #    并不检查引用可达性——对象在盘上但没有持久引用背书时它仍返回 0，
+            #    因此必须先做显式可达性门禁，不能只看 verify 的返回码。
             pending = list(range(len(bundles)))
             order = []
             verify_err = {}
@@ -217,6 +325,9 @@ def import_bundles(repo, files):
                 progressed = False
                 for idx in list(pending):
                     b = bundles[idx]
+                    miss = missing_prereqs(q, b)
+                    if miss:
+                        continue
                     proc = git(q, "bundle", "verify", b.path, check=False)
                     if proc.returncode == 0:
                         git(q, "fetch", "--no-tags", "--", b.path,
@@ -331,13 +442,17 @@ def import_bundles(repo, files):
             result["reason"] = f"内部错误：{exc!r}。整批退回。"
             return result
         finally:
-            if tmp_refs_created:
-                stale = git(repo, "for-each-ref", "--format=%(refname)",
-                            TMP_REFS_PREFIX, check=False).stdout.split()
-                if stale:
-                    git(repo, "update-ref", "--stdin",
-                        input_text="".join(f"delete {r}\n" for r in stale),
-                        check=False)
+            # 只清理本批自己的临时引用空间，不碰其他批次的历史残留（那是启动
+            # 清理的职责）；逐个删除，避免单个失败连累本批其余引用也清不掉。
+            # 只删引用，不扫描、不复制、不删除任何对象。
+            if tmp_refs_created and batch is not None:
+                own_prefix = f"{TMP_REFS_PREFIX}{batch}/"
+                own_refs = sorted(list_refs(repo, own_prefix))
+                failed = delete_refs_individually(repo, own_refs)
+                if failed:
+                    logger.error("本批临时引用有 %d 项删除失败（共 %d 项），"
+                                 "将在下次启动时重试清理：%s",
+                                 len(failed), len(own_refs), failed[0][1])
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -346,6 +461,8 @@ def import_bundles(repo, files):
 # --------------------------------------------------------------------------
 
 def page_context(result=None):
+    # 重启后首次打开页面即清理上次强停遗留的临时引用（仅一次，失败不阻断）
+    ensure_startup_cleanup(REPO_PATH)
     try:
         branches = list_branches(REPO_PATH)
         repo_error = None

@@ -53,6 +53,9 @@ C2=$(commit C2 two)
 # 此刻仓库状态即部署仓库的初始状态：main=C2，另有 stable=C1（演示无关分支不受影响）
 git branch stable "$C1"
 git clone -q --bare "$WORK/repo" "$SAMPLES/repo.git"
+# 显式保留空 refs 目录：部分打包方式会丢弃空目录，而缺少 refs/ 时 git 会
+# 拒绝承认该仓库（仅靠 packed-refs 不够）。
+mkdir -p "$SAMPLES/repo.git/refs/heads" "$SAMPLES/repo.git/refs/tags"
 
 C3=$(commit C3 three)
 C4=$(commit C4 four)
